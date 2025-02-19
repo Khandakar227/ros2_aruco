@@ -1,32 +1,3 @@
-"""
-This node locates Aruco AR markers in images and publishes their ids and poses.
-
-Subscriptions:
-   /camera/image_raw (sensor_msgs.msg.Image)
-   /camera/camera_info (sensor_msgs.msg.CameraInfo)
-   /camera/camera_info (sensor_msgs.msg.CameraInfo)
-
-Published Topics:
-    /aruco_poses (geometry_msgs.msg.PoseArray)
-       Pose of all detected markers (suitable for rviz visualization)
-
-    /aruco_markers (ros2_aruco_interfaces.msg.ArucoMarkers)
-       Provides an array of all poses along with the corresponding
-       marker ids.
-
-Parameters:
-    marker_size - size of the markers in meters (default .0625)
-    aruco_dictionary_id - dictionary that was used to generate markers
-                          (default DICT_5X5_250)
-    image_topic - image topic to subscribe to (default /camera/image_raw)
-    camera_info_topic - camera info topic to subscribe to
-                         (default /camera/camera_info)
-
-Author: Nathan Sprague
-Version: 10/26/2020
-
-"""
-
 import rclpy
 import rclpy.node
 from rclpy.qos import qos_profile_sensor_data
@@ -34,12 +5,56 @@ from cv_bridge import CvBridge
 import numpy as np
 import cv2
 import tf_transformations
-from sensor_msgs.msg import CameraInfo
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
+
+def estimatePoseSingleMarkers(corners, marker_size, camera_matrix, dist_coeffs):
+    """
+    Custom implementation of OpenCV's estimatePoseSingleMarkers.
+
+    Args:
+        corners (numpy.ndarray): Detected marker corners (N, 1, 4, 2).
+        marker_size (float): Size of the marker in meters.
+        camera_matrix (numpy.ndarray): Camera intrinsic matrix (3x3).
+        dist_coeffs (numpy.ndarray): Camera distortion coefficients (1x5 or None).
+
+    Returns:
+        rvecs (numpy.ndarray): Rotation vectors for each marker (N, 1, 3).
+        tvecs (numpy.ndarray): Translation vectors for each marker (N, 1, 3).
+        marker_points (numpy.ndarray): 3D marker corner points (4, 3).
+    """
+
+    # Define the 3D marker corner points assuming Z=0
+    half_size = marker_size / 2
+    marker_points = np.array([
+        [-half_size,  half_size, 0],
+        [ half_size,  half_size, 0],
+        [ half_size, -half_size, 0],
+        [-half_size, -half_size, 0]
+    ], dtype=np.float32)
+
+    rvecs, tvecs = [], []
+
+    for corner in corners:
+        # Ensure correct shape
+        if corner.shape != (4, 2):
+            corner = corner.reshape((4, 2))
+
+        # Solve for pose using PnP
+        success, rvec, tvec = cv2.solvePnP(marker_points, corner, camera_matrix, dist_coeffs)
+
+        if success:
+            rvecs.append(rvec.reshape(1, 3))  # Reshape to (1, 3) for consistency
+            tvecs.append(tvec.reshape(1, 3))  # Reshape to (1, 3) for correct indexing
+
+    # Convert lists to numpy arrays
+    rvecs = np.array(rvecs, dtype=np.float32)  # Shape: (N, 1, 3)
+    tvecs = np.array(tvecs, dtype=np.float32)  # Shape: (N, 1, 3)
+
+    return rvecs, tvecs, marker_points
 
 class ArucoNode(rclpy.node.Node):
     def __init__(self):
@@ -127,6 +142,11 @@ class ArucoNode(rclpy.node.Node):
             options = "\n".join([s for s in dir(cv2.aruco) if s.startswith("DICT")])
             self.get_logger().error("valid options: {}".format(options))
 
+        # Set up ArUco dictionary and detector parameters
+        self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.aruco_parameters = cv2.aruco.DetectorParameters()
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dictionary, self.aruco_parameters)
+
         # Set up subscriptions
         self.info_sub = self.create_subscription(
             CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data
@@ -145,8 +165,6 @@ class ArucoNode(rclpy.node.Node):
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.bridge = CvBridge()
 
     def info_callback(self, info_msg):
@@ -174,23 +192,16 @@ class ArucoNode(rclpy.node.Node):
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
 
-        corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-            cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
-        )
+        corners, marker_ids, rejected = self.aruco_detector.detectMarkers(cv_image)
         if marker_ids is not None:
-            if cv2.__version__ > "4.0.0":
-                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
-            else:
-                rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
+            rvecs, tvecs, _ = estimatePoseSingleMarkers(
+                corners, self.marker_size, self.intrinsic_mat, self.distortion
+            )
             for i, marker_id in enumerate(marker_ids):
                 pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
+                pose.position.x = float(tvecs[i][0][0])
+                pose.position.y = float(tvecs[i][0][1])
+                pose.position.z = float(tvecs[i][0][2])
 
                 rot_matrix = np.eye(4)
                 rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
